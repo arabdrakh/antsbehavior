@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D Colony Visualizer - Instanced Ultra Performance</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="canvas-wrap"></div>
+
+<div id="hud" class="glass-panel">
+  <div class="title">lem-in &mdash; colony trace</div>
+  <div class="turn">turn <span id="turn-num">0</span> / <span id="turn-total">0</span></div>
+</div>
+
+<div id="legend" class="glass-panel">
+  <div class="legend-item">start <span class="dot" style="background:var(--start-glow);"></span></div>
+  <div class="legend-item">end <span class="dot" style="background:var(--end-glow);"></span></div>
+  <div class="legend-item">ant <span class="dot" style="background:var(--ant-glow);"></span></div>
+</div>
+
+<div id="controls-wrapper" class="glass-panel">
+  <div id="controls">
+    <button id="btn-play" title="Play / Pause">&#9658;</button>
+    <button id="btn-reset" title="Restart">&#8634;</button>
+    <input id="scrubber" type="range" min="0" max="0" step="1" value="0">
+    <span id="speed">0.6s / turn</span>
+  </div>
+</div>
+
+<div id="drop-hint">
+  <h1>Drop colony.json to begin</h1>
+  <p>Generate it with: <code>go run ./src/go --json colony.json example05.txt</code></p>
+  <div class="zone" id="drop-zone">Click to choose a file, or drag it here</div>
+  <input id="file-input" type="file" accept=".json">
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  const wrap = document.getElementById('canvas-wrap');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0f172a); 
+
+  const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 3000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  wrap.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+  const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight1.position.set(200, 400, 200);
+  scene.add(dirLight1);
+  const dirLight2 = new THREE.DirectionalLight(0x38bdf8, 0.35); 
+  dirLight2.position.set(-200, 200, -200);
+  scene.add(dirLight2);
+
+  let camTarget = new THREE.Vector3(0, 0, 0);
+  let camDistance = 400;
+  let camTheta = Math.PI * 0.32;
+  let camPhi = Math.PI * 0.36;
+  let isDragging = false;
+  let lastX = 0, lastY = 0;
+
+  function updateCamera() {
+    const x = camTarget.x + camDistance * Math.sin(camPhi) * Math.cos(camTheta);
+    const y = camTarget.y + camDistance * Math.cos(camPhi);
+    const z = camTarget.z + camDistance * Math.sin(camPhi) * Math.sin(camTheta);
+    camera.position.set(x, y, z);
+    camera.lookAt(camTarget);
+  }
+
+  renderer.domElement.addEventListener('mousedown', (e) => {
+    isDragging = true; lastX = e.clientX; lastY = e.clientY;
+  });
+  window.addEventListener('mouseup', () => isDragging = false);
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    camTheta -= dx * 0.005;
+    camPhi = Math.max(0.1, Math.min(Math.PI - 0.1, camPhi - dy * 0.005));
+    lastX = e.clientX; lastY = e.clientY;
+    updateCamera();
+  });
+  renderer.domElement.addEventListener('wheel', (e) => {
+    camDistance = Math.max(60, Math.min(1400, camDistance + e.deltaY * 0.5));
+    updateCamera();
+  }, { passive: true });
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  const grid = new THREE.GridHelper(1200, 48, 0x1e293b, 0x334155);
+  grid.position.y = -35;
+  grid.material.opacity = 0.3;
+  grid.material.transparent = true;
+  scene.add(grid);
+
+  let farm = null;
+  let roomMeshes = {};
+  let roomPositions = {};
+  let tunnelLines = {};
+  let antMeshes = {};
+  let instancedAnts = null; 
+
+  let currentTurn = 0;
+  let playing = false;
+  let lastStepTime = 0;
+  let stepInterval = 600;
+
+  function createAntGeometry() {
+    const baseGeo = new THREE.CylinderGeometry(0.6, 0.8, 2.5, 6);
+    baseGeo.rotateZ(Math.PI / 2);
+    return baseGeo;
+  }
+
+  function buildColony(data) {
+    farm = data;
+
+    // Очистка сцены от старых объектов
+    if (instancedAnts) scene.remove(instancedAnts);
+    Object.keys(roomMeshes).forEach(k => scene.remove(roomMeshes[k]));
+    while(scene.children.filter(c => c.isGroup || c.isLine || c.isSprite).length > 0) {
+      scene.children.forEach(c => {
+        if(c.isGroup || c.isLine || c.isSprite || c.isLineSegments) scene.remove(c);
+      });
+    }
+
+    roomMeshes = {}; roomPositions = {}; tunnelLines = {};
+    const roomGroup = new THREE.Group(); scene.add(roomGroup);
+    const tunnelGroup = new THREE.Group(); scene.add(tunnelGroup);
+
+    const xs = farm.rooms.map(r => r.x);
+    const ys = farm.rooms.map(r => r.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const rangeX = Math.max(maxX - minX, 1);
+    const rangeY = Math.max(maxY - minY, 1);
+    const SCALE = 300;
+
+    farm.rooms.forEach(r => {
+      const px = ((r.x - minX) / rangeX - 0.5) * SCALE;
+      const pz = ((r.y - minY) / rangeY - 0.5) * SCALE;
+      roomPositions[r.name] = new THREE.Vector3(px, 0, pz);
+    });
+
+    camTarget.set(0, 5, 0);
+    updateCamera();
+
+    farm.rooms.forEach(r => {
+      const isStart = r.name === farm.start;
+      const isEnd = r.name === farm.end;
+      const color = 0x111827; 
+      const glowColor = isStart ? 0x0ea5e9 : (isEnd ? 0x10b981 : 0x475569);
+      const size = isStart || isEnd ? 14 : 11;
+
+      const geo = new THREE.BoxGeometry(size, size, size);
+      const mat = new THREE.MeshStandardMaterial({ color, emissive: glowColor, emissiveIntensity: 0.6, roughness: 0.2, metalness: 0.5 });
+      const mesh = new THREE.Mesh(geo, mat);
+      const pos = roomPositions[r.name];
+      mesh.position.copy(pos);
+      roomGroup.add(mesh);
+      roomMeshes[r.name] = mesh;
+
+      const edges = new THREE.EdgesGeometry(geo);
+      const lineMat = new THREE.LineBasicMaterial({ color: glowColor, linewidth: 2 });
+      const wireframe = new THREE.LineSegments(edges, lineMat);
+      wireframe.position.copy(pos);
+      roomGroup.add(wireframe);
+
+      const label = makeTextSprite(r.name, '#ffffff');
+      label.position.set(pos.x, pos.y + size + 5, pos.z);
+      roomGroup.add(label);
+    });
+
+    farm.links.forEach(link => {
+      const a = roomPositions[link.from];
+      const b = roomPositions[link.to];
+      if (!a || !b) return;
+      const points = [a, b];
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.9 });
+      const line = new THREE.Line(geo, mat);
+      tunnelGroup.add(line);
+      tunnelLines[link.from + '|' + link.to] = mat;
+      tunnelLines[link.to + '|' + link.from] = mat;
+    });
+
+    const antGeo = createAntGeometry();
+    const antMat = new THREE.MeshStandardMaterial({ 
+      color: 0x7c2d12, 
+      emissive: 0x220700, 
+      roughness: 0.15, 
+      metalness: 0.2 
+    });
+    
+    instancedAnts = new THREE.InstancedMesh(antGeo, antMat, farm.num_ants);
+    instancedAnts.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    scene.add(instancedAnts);
+
+    antMeshes = {};
+    for (let i = 1; i <= farm.num_ants; i++) {
+      const startPos = roomPositions[farm.start].clone();
+      
+      startPos.x += (Math.random() - 0.5) * 8;
+      startPos.z += (Math.random() - 0.5) * 8;
+      startPos.y += 6; 
+
+      antMeshes[i] = { 
+        position: startPos,
+        targetPosition: startPos.clone(),
+        room: farm.start,
+        currentRotation: 0,
+        walkTime: Math.random() * 100
+      };
+    }
+
+    currentTurn = 0;
+    document.getElementById('turn-total').textContent = farm.turns.length;
+    document.getElementById('scrubber').max = farm.turns.length;
+    document.getElementById('scrubber').value = 0;
+    updateHud();
+  }
+
+  function makeTextSprite(text, color) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const fontSize = 24;
+    ctx.font = `700 ${fontSize}px 'JetBrains Mono', monospace`;
+    const w = ctx.measureText(text).width + 16;
+    canvas.width = w * 2;
+    canvas.height = (fontSize + 12) * 2;
+    ctx.scale(2, 2);
+    ctx.font = `700 ${fontSize}px 'JetBrains Mono', monospace`;
+    ctx.fillStyle = color;
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 8, (fontSize + 12) / 2);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(w * 0.18, (fontSize + 12) * 0.18, 1);
+    return sprite;
+  }
+
+  function applyTurn(turnIndex) {
+    if (!farm || turnIndex < 1 || turnIndex > farm.turns.length) return;
+    const moves = farm.turns[turnIndex - 1];
+    moves.forEach(token => {
+      const m = token.match(/^L(\d+)-(.+)$/);
+      if (!m) return;
+      const id = parseInt(m[1], 10);
+      const room = m[2];
+      const ant = antMeshes[id];
+      if (!ant) return;
+
+      const prevRoom = ant.room;
+      ant.room = room;
+
+      const key = prevRoom + '|' + room;
+      const mat = tunnelLines[key];
+      if (mat) {
+        mat.color.set(0xff6b00); 
+        setTimeout(() => { mat.color.set(0x334155); }, stepInterval * 0.8);
+      }
+    });
+  }
+
+  function renderAntPositions() {
+    if (!farm || !instancedAnts) return;
+
+    const byRoom = {};
+    Object.keys(antMeshes).forEach(id => {
+      const a = antMeshes[id];
+      byRoom[a.room] = byRoom[a.room] || [];
+      byRoom[a.room].push(id);
+    });
+
+    const dummy = new THREE.Object3D();
+    let idx = 0;
+
+    Object.keys(byRoom).forEach(room => {
+      const ids = byRoom[room];
+      const base = roomPositions[room];
+      if (!base) return;
+      
+      const isStartOrEnd = (room === farm.start || room === farm.end);
+      const boxSize = isStartOrEnd ? 14 : 11;
+      const n = ids.length;
+
+      const maxRadius = n > 200 ? 18 : (n > 50 ? 12 : 5);
+
+      ids.forEach((id, i) => {
+        const ant = antMeshes[id];
+        
+        const theta = i * 2.39996; 
+        const r = n > 1 ? (Math.min(maxRadius, 1.2 * Math.sqrt(i))) : 0;
+        
+        const targetX = base.x + Math.cos(theta) * r;
+        const targetZ = base.z + Math.sin(theta) * r;
+        const targetY = base.y + (boxSize / 2);
+
+        const dx = targetX - ant.position.x;
+        const dz = targetZ - ant.position.z;
+        const distSq = dx * dx + dz * dz;
+
+        let isMoving = false;
+        if (distSq > 0.05) {
+          isMoving = true;
+          ant.position.x += dx * 0.12;
+          ant.position.z += dz * 0.12;
+          ant.position.y += (targetY - ant.position.y) * 0.12;
+
+          const targetRotation = Math.atan2(-dz, dx);
+          let diff = targetRotation - ant.currentRotation;
+          diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+          ant.currentRotation += diff * 0.2;
+        }
+
+        dummy.position.copy(ant.position);
+        dummy.rotation.y = ant.currentRotation;
+
+        if (isMoving) {
+          ant.walkTime += 0.4;
+          const scalePulse = 1.0 + Math.sin(ant.walkTime) * 0.08;
+          dummy.scale.set(scalePulse, 1.0, 1.0);
+        } else {
+          dummy.scale.set(1.1, 1.1, 1.1);
+        }
+
+        dummy.updateMatrix();
+        instancedAnts.setMatrixAt(idx++, dummy.matrix);
+      });
+    });
+
+    instancedAnts.instanceMatrix.needsUpdate = true;
+  }
+
+  function goToTurn(target) {
+    target = Math.max(0, Math.min(farm.turns.length, target));
+    if (target === currentTurn) return;
+
+    if (target > currentTurn) {
+      for (let t = currentTurn + 1; t <= target; t++) applyTurn(t);
+    } else {
+      resetAnts();
+      for (let t = 1; t <= target; t++) applyTurn(t);
+    }
+    currentTurn = target;
+    updateHud();
+  }
+
+  function resetAnts() {
+    if (!farm) return;
+    Object.keys(antMeshes).forEach(id => {
+      const startPos = roomPositions[farm.start].clone();
+      startPos.x += (Math.random() - 0.5) * 8;
+      startPos.z += (Math.random() - 0.5) * 8;
+      startPos.y += 7;
+      antMeshes[id].position.copy(startPos);
+      antMeshes[id].room = farm.start;
+    });
+  }
+
+  function updateHud() {
+    document.getElementById('turn-num').textContent = currentTurn;
+    document.getElementById('scrubber').value = currentTurn;
+  }
+
+  function animate(time) {
+    requestAnimationFrame(animate);
+
+    if (playing && farm) {
+      if (time - lastStepTime > stepInterval) {
+        lastStepTime = time;
+        if (currentTurn < farm.turns.length) {
+          goToTurn(currentTurn + 1);
+        } else {
+          playing = false;
+          document.getElementById('btn-play').innerHTML = '&#9658;';
+        }
+      }
+    }
+
+    renderAntPositions();
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame(animate);
+
+  document.getElementById('btn-play').addEventListener('click', () => {
+    playing = !playing;
+    document.getElementById('btn-play').innerHTML = playing ? '&#10073;&#10073;' : '&#9658;';
+    lastStepTime = 0;
+  });
+
+  document.getElementById('btn-reset').addEventListener('click', () => {
+    playing = false;
+    document.getElementById('btn-play').innerHTML = '&#9658;';
+    resetAnts();
+    currentTurn = 0;
+    updateHud();
+  });
+
+  document.getElementById('scrubber').addEventListener('input', (e) => {
+    playing = false;
+    document.getElementById('btn-play').innerHTML = '&#9658;';
+    goToTurn(parseInt(e.target.value, 10));
+  });
+
+  const dropHint = document.getElementById('drop-hint');
+  const dropZone = document.getElementById('drop-zone');
+  const fileInput = document.getElementById('file-input');
+
+  function loadJSONText(text) {
+    try {
+      const data = JSON.parse(text);
+      buildColony(data);
+      dropHint.classList.add('hidden');
+    } catch (err) {
+      alert('Could not parse colony.json: ' + err.message);
+    }
+  }
+
+  dropZone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => loadJSONText(ev.target.result);
+    reader.readAsText(file);
+  });
+
+  ['dragover', 'dragenter'].forEach(ev =>
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    })
+  );
+  ['dragleave', 'dragend'].forEach(ev =>
+    dropZone.addEventListener(ev, () => dropZone.classList.remove('dragover'))
+  );
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => loadJSONText(ev.target.result);
+    reader.readAsText(file);
+  });
+
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => {
+    if (!dropHint.classList.contains('hidden')) return;
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => loadJSONText(ev.target.result);
+    reader.readAsText(file);
+  });
+
+})();
+</script>
+
+</body>
+</html>
